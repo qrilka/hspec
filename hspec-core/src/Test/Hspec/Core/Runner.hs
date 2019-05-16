@@ -46,8 +46,10 @@ import qualified Test.QuickCheck as QC
 import           Test.Hspec.Core.Util (Path)
 import           Test.Hspec.Core.Spec
 import           Test.Hspec.Core.Config
+import           Test.Hspec.Core.Format (Format)
 import           Test.Hspec.Core.Formatters
-import           Test.Hspec.Core.Formatters.Internal
+import           Test.Hspec.Core.Formatters.Internal (FormatConfig(..), formattersToFormat)
+import qualified Test.Hspec.Core.Formatters.Internal as I
 import           Test.Hspec.Core.FailureReport
 import           Test.Hspec.Core.QuickCheckUtil
 
@@ -205,8 +207,8 @@ focusSpec config spec
 
 runSpec_ :: Config -> Spec -> IO Summary
 runSpec_ config spec = do
-  withHandle config $ \h -> do
-    let formatter = fromMaybe specdoc (configFormatter config)
+  withHandles config $ \outputs -> do
+    let outputs' = map (\(mf, h) -> (fromMaybe specdoc mf, h)) outputs
         seed = (fromJust . configQuickCheckSeed) config
         qcArgs = configQuickCheckArgs config
 
@@ -214,26 +216,15 @@ runSpec_ config spec = do
       Nothing -> getDefaultConcurrentJobs
       Just n -> return n
 
-    useColor <- doesUseColor h config
-
     let
       focusedSpec = focusSpec config (failFocusedItems config spec)
       params = Params (configQuickCheckArgs config) (configSmallCheckDepth config)
 
     filteredSpec <- filterSpecs config . mapMaybe (toEvalTree params) . applyDryRun config <$> runSpecM focusedSpec
 
-    (total, failures) <- withHiddenCursor useColor h $ do
-      let
-        formatConfig = FormatConfig {
-          formatConfigHandle = h
-        , formatConfigUseColor = useColor
-        , formatConfigUseDiff = configDiff config
-        , formatConfigHtmlOutput = configHtmlOutput config
-        , formatConfigPrintCpuTime = configPrintCpuTime config
-        , formatConfigUsedSeed =  seed
-        }
-        evalConfig = EvalConfig {
-          evalConfigFormat = formatterToFormat formatter formatConfig
+    (total, failures) <- withFormats outputs' seed config $ \format -> do
+      let evalConfig = EvalConfig {
+          evalConfigFormat = format
         , evalConfigConcurrentJobs = concurrentJobs
         , evalConfigFastFail = configFastFail config
         }
@@ -241,6 +232,22 @@ runSpec_ config spec = do
 
     dumpFailureReport config seed qcArgs failures
     return (Summary total (length failures))
+
+withFormats :: [(Formatter, Handle)] -> Integer -> Config -> (Format I.FormatM -> IO a) -> IO a
+withFormats fs seed config runFormat = go fs [] id
+  where
+    go [] fmts brk = do
+      let formatConfig = FormatConfig {
+          formatConfigUseDiff = configDiff config
+        , formatConfigHtmlOutput = configHtmlOutput config
+        , formatConfigPrintCpuTime = configPrintCpuTime config
+        , formatConfigUsedSeed =  seed
+        }
+          format = formattersToFormat fmts formatConfig
+      brk $ runFormat format
+    go ((f, h):rest) fmts brk = do
+      useColor <- doesUseColor h config
+      go rest ((f, h, useColor):fmts) (withHiddenCursor useColor h . brk)
 
 toEvalTree :: Params -> SpecTree () -> Maybe EvalTree
 toEvalTree params = go
@@ -276,10 +283,12 @@ doesUseColor h c = case configColorMode c of
   ColorNever -> return False
   ColorAlways -> return True
 
-withHandle :: Config -> (Handle -> IO a) -> IO a
-withHandle c action = case configOutputFile c of
-  Left h -> action h
-  Right path -> withFile path WriteMode action
+withHandles :: Config -> ([(Maybe Formatter, Handle)] -> IO a) -> IO a
+withHandles c action = go (configOutputs c) []
+  where
+    go [] acc = action acc
+    go ((f, Left h):rest) acc = go rest ((f, h):acc)
+    go ((f, Right path):rest) acc = withFile path WriteMode $ \h -> go rest ((f, h):acc)
 
 rerunAll :: Config -> Maybe FailureReport -> Summary -> Bool
 rerunAll _ Nothing _ = False

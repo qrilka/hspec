@@ -54,8 +54,8 @@ spec = do
         configDiff <$> parseOptions [] Nothing ["--no-diff"] `shouldBe` Right False
 
     context "with --out" $ do
-      it "sets configOutputFile" $ do
-        either (const Nothing) Just . configOutputFile <$> parseOptions [] Nothing ["--out", "foo"] `shouldBe` Right (Just "foo")
+      it "sets configOutputs file" $ do
+        map (either (const Nothing) Just . snd) . configOutputs <$> parseOptions [] Nothing ["--out", "foo"] `shouldBe` Right [Just "foo"]
 
     context "with --qc-max-success" $ do
       context "when given an invalid argument" $ do

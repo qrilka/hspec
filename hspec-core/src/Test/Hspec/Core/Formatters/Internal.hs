@@ -8,7 +8,7 @@ module Test.Hspec.Core.Formatters.Internal (
 , increasePendingCount
 , addFailMessage
 , finally_
-, formatterToFormat
+, formattersToFormat
 ) where
 
 import           Prelude ()
@@ -28,49 +28,53 @@ import           Test.Hspec.Core.Formatters.Monad (Environment(..), interpretWit
 import           Test.Hspec.Core.Format
 import           Test.Hspec.Core.Clock
 
-formatterToFormat :: M.Formatter -> FormatConfig -> Format FormatM
-formatterToFormat formatter config = Format {
+formattersToFormat :: [(M.Formatter, Handle, Bool)] -> FormatConfig -> Format FormatM
+formattersToFormat formatters config = Format {
   formatRun = \action -> runFormatM config $ do
-    interpret (M.headerFormatter formatter)
-    a <- action `finally_` interpret (M.failedFormatter formatter)
-    interpret (M.footerFormatter formatter)
+    interpretFormatters M.headerFormatter
+    a <- action `finally_` interpretFormatters M.failedFormatter
+    interpretFormatters $ M.footerFormatter
     return a
-, formatGroupStarted = \ (nesting, name) -> interpret $ M.exampleGroupStarted formatter nesting name
-, formatGroupDone = \ _ -> interpret (M.exampleGroupDone formatter)
-, formatProgress = \ path progress -> when useColor $ do
-    interpret $ M.exampleProgress formatter path progress
+, formatGroupStarted = \ (nesting, name) ->
+    interpretFormatters $ \formatter -> M.exampleGroupStarted formatter nesting name
+, formatGroupDone = \ _ -> interpretFormatters M.exampleGroupDone
+, formatProgress = \ path progress -> {-when useColor $-} do
+    interpretFormatters $ \formatter -> M.exampleProgress formatter path progress
 , formatItem = \ path (Item loc _duration info result) -> do
-    clearTransientOutput
+    forM_ formatters $ \(_, h, _) ->
+        clearTransientOutput h
     case result of
       Success -> do
         increaseSuccessCount
-        interpret $ M.exampleSucceeded formatter path info
+        interpretFormatters $ \formatter -> M.exampleSucceeded formatter path info
       Pending reason -> do
         increasePendingCount
-        interpret $ M.examplePending formatter path info reason
+        interpretFormatters $ \formatter -> M.examplePending formatter path info reason
       Failure err -> do
         addFailMessage loc path err
-        interpret $ M.exampleFailed formatter path info err
+        interpretFormatters $ \formatter -> M.exampleFailed formatter path info err
 } where
-    useColor = formatConfigUseColor config
+    interpretFormatters action = do
+      forM_ formatters $ \(f, h, c) ->
+        interpret h c $ action f
 
-interpret :: M.FormatM a -> FormatM a
-interpret = interpretWith Environment {
+interpret :: Handle -> Bool -> M.FormatM a -> FormatM a
+interpret h useColor = interpretWith Environment {
   environmentGetSuccessCount = getSuccessCount
 , environmentGetPendingCount = getPendingCount
 , environmentGetFailMessages = getFailMessages
 , environmentUsedSeed = usedSeed
 , environmentGetCPUTime = getCPUTime
 , environmentGetRealTime = getRealTime
-, environmentWrite = write
-, environmentWriteTransient = writeTransient
-, environmentWithFailColor = withFailColor
-, environmentWithSuccessColor = withSuccessColor
-, environmentWithPendingColor = withPendingColor
-, environmentWithInfoColor = withInfoColor
+, environmentWrite = write h
+, environmentWriteTransient = writeTransient h
+, environmentWithFailColor = withFailColor h useColor
+, environmentWithSuccessColor = withSuccessColor h useColor
+, environmentWithPendingColor = withPendingColor h useColor
+, environmentWithInfoColor = withInfoColor h useColor
 , environmentUseDiff = gets (formatConfigUseDiff . stateConfig)
-, environmentExtraChunk = extraChunk
-, environmentMissingChunk = missingChunk
+, environmentExtraChunk = extraChunk h useColor
+, environmentMissingChunk = missingChunk h useColor
 , environmentLiftIO = liftIO
 }
 
@@ -85,9 +89,7 @@ modify f = FormatM $ do
   get >>= liftIO . (`modifyIORef'` f)
 
 data FormatConfig = FormatConfig {
-  formatConfigHandle :: Handle
-, formatConfigUseColor :: Bool
-, formatConfigUseDiff :: Bool
+  formatConfigUseDiff :: Bool
 , formatConfigHtmlOutput :: Bool
 , formatConfigPrintCpuTime :: Bool
 , formatConfigUsedSeed :: Integer
@@ -105,9 +107,6 @@ data FormatterState = FormatterState {
 
 getConfig :: (FormatConfig -> a) -> FormatM a
 getConfig f = gets (f . stateConfig)
-
-getHandle :: FormatM Handle
-getHandle = getConfig formatConfigHandle
 
 -- | The random seed that is used for QuickCheck.
 usedSeed :: FormatM Integer
@@ -149,60 +148,54 @@ addFailMessage loc p m = modify $ \s -> s {stateFailMessages = FailureRecord loc
 getFailMessages :: FormatM [FailureRecord]
 getFailMessages = reverse `fmap` gets stateFailMessages
 
-writeTransient :: String -> FormatM ()
-writeTransient s = do
-  write ("\r" ++ s)
+writeTransient :: Handle -> String -> FormatM ()
+writeTransient h s = do
+  write h ("\r" ++ s)
   modify $ \ state -> state {stateTransientOutput = s}
-  h <- getHandle
   liftIO $ IO.hFlush h
 
-clearTransientOutput :: FormatM ()
-clearTransientOutput = do
+clearTransientOutput :: Handle -> FormatM ()
+clearTransientOutput h = do
   n <- length <$> gets stateTransientOutput
   unless (n == 0) $ do
-    write ("\r" ++ replicate n ' ' ++ "\r")
+    write h ("\r" ++ replicate n ' ' ++ "\r")
     modify $ \ state -> state {stateTransientOutput = ""}
 
 -- | Append some output to the report.
-write :: String -> FormatM ()
-write s = do
-  h <- getHandle
-  liftIO $ IO.hPutStr h s
+write :: Handle -> String -> FormatM ()
+write h s = liftIO $ IO.hPutStr h s
 
 -- | Set output color to red, run given action, and finally restore the default
 -- color.
-withFailColor :: FormatM a -> FormatM a
-withFailColor = withColor (SetColor Foreground Dull Red) "hspec-failure"
+withFailColor :: Handle -> Bool -> FormatM a -> FormatM a
+withFailColor h useColor = withColor h useColor (SetColor Foreground Dull Red) "hspec-failure"
 
 -- | Set output color to green, run given action, and finally restore the
 -- default color.
-withSuccessColor :: FormatM a -> FormatM a
-withSuccessColor = withColor (SetColor Foreground Dull Green) "hspec-success"
+withSuccessColor :: Handle -> Bool -> FormatM a -> FormatM a
+withSuccessColor h useColor = withColor h useColor (SetColor Foreground Dull Green) "hspec-success"
 
 -- | Set output color to yellow, run given action, and finally restore the
 -- default color.
-withPendingColor :: FormatM a -> FormatM a
-withPendingColor = withColor (SetColor Foreground Dull Yellow) "hspec-pending"
+withPendingColor :: Handle -> Bool -> FormatM a -> FormatM a
+withPendingColor h useColor = withColor h useColor (SetColor Foreground Dull Yellow) "hspec-pending"
 
 -- | Set output color to cyan, run given action, and finally restore the
 -- default color.
-withInfoColor :: FormatM a -> FormatM a
-withInfoColor = withColor (SetColor Foreground Dull Cyan) "hspec-info"
+withInfoColor :: Handle -> Bool -> FormatM a -> FormatM a
+withInfoColor h useColor = withColor h useColor (SetColor Foreground Dull Cyan) "hspec-info"
 
 -- | Set a color, run an action, and finally reset colors.
-withColor :: SGR -> String -> FormatM a -> FormatM a
-withColor color cls action = do
+withColor :: Handle -> Bool -> SGR -> String -> FormatM a -> FormatM a
+withColor h useColor color cls action = do
   produceHTML <- getConfig formatConfigHtmlOutput
-  (if produceHTML then htmlSpan cls else withColor_ color) action
+  (if produceHTML then htmlSpan h cls else withColor_ h useColor color) action
 
-htmlSpan :: String -> FormatM a -> FormatM a
-htmlSpan cls action = write ("<span class=\"" ++ cls ++ "\">") *> action <* write "</span>"
+htmlSpan :: Handle -> String -> FormatM a -> FormatM a
+htmlSpan h cls action = write h ("<span class=\"" ++ cls ++ "\">") *> action <* write h "</span>"
 
-withColor_ :: SGR -> FormatM a -> FormatM a
-withColor_ color (FormatM action) = do
-  useColor <- getConfig formatConfigUseColor
-  h <- getHandle
-
+withColor_ :: Handle -> Bool -> SGR -> FormatM a -> FormatM a
+withColor_ h useColor color (FormatM action) =
   FormatM . StateT $ \st -> do
     bracket_
 
@@ -212,34 +205,34 @@ withColor_ color (FormatM action) = do
       -- reset colors
       (when useColor $ hSetSGR h [Reset])
 
-      -- run action
+      -- run deeper action
       (runStateT action st)
 
 -- | Output given chunk in red.
-extraChunk :: String -> FormatM ()
-extraChunk s = do
+extraChunk :: Handle -> Bool -> String -> FormatM ()
+extraChunk h useColor s = do
   useDiff <- getConfig formatConfigUseDiff
   case useDiff of
     True -> extra s
-    False -> write s
+    False -> write h s
   where
     extra :: String -> FormatM ()
-    extra = diffColorize Red "hspec-failure"
+    extra = diffColorize h useColor Red "hspec-failure"
 
 -- | Output given chunk in green.
-missingChunk :: String -> FormatM ()
-missingChunk s = do
+missingChunk :: Handle -> Bool -> String -> FormatM ()
+missingChunk h useColor s = do
   useDiff <- getConfig formatConfigUseDiff
   case useDiff of
     True -> missing s
-    False -> write s
+    False -> write h s
   where
     missing :: String-> FormatM ()
-    missing = diffColorize Green "hspec-success"
+    missing = diffColorize h useColor Green "hspec-success"
 
-diffColorize :: Color -> String -> String-> FormatM ()
-diffColorize color cls s = withColor (SetColor layer Dull color) cls $ do
-  write s
+diffColorize :: Handle -> Bool -> Color -> String -> String-> FormatM ()
+diffColorize h useColor color cls s = withColor h useColor (SetColor layer Dull color) cls $ do
+  write h s
   where
     layer
       | all isSpace s = Background

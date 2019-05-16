@@ -53,9 +53,8 @@ data Config = Config {
 , configSmallCheckDepth :: Int
 , configColorMode :: ColorMode
 , configDiff :: Bool
-, configFormatter :: Maybe Formatter
+, configOutputs :: [(Maybe Formatter, Either Handle FilePath)]
 , configHtmlOutput :: Bool
-, configOutputFile :: Either Handle FilePath
 , configConcurrentJobs :: Maybe Int
 }
 
@@ -79,9 +78,8 @@ defaultConfig = Config {
 , configSmallCheckDepth = paramsSmallCheckDepth defaultParams
 , configColorMode = ColorAuto
 , configDiff = True
-, configFormatter = Nothing
+, configOutputs = [(Nothing, Left stdout)]
 , configHtmlOutput = False
-, configOutputFile = Left stdout
 , configConcurrentJobs = Nothing
 }
 
@@ -170,7 +168,7 @@ formatterOptions = concat [
     readFormatter = (`lookup` formatters)
 
     setFormatter :: Formatter -> Config -> Config
-    setFormatter f c = c {configFormatter = Just f}
+    setFormatter f c = c {configOutputs = map (\(_, h) -> (Just f, h)) (configOutputs c)}
 
     setColor :: Bool -> Config -> Config
     setColor v config = config {configColorMode = if v then ColorAlways else ColorNever}
@@ -268,7 +266,7 @@ undocumentedOptions = [
     setHtml = set $ \config -> config {configHtmlOutput = True}
 
     setOutputFile :: String -> Config -> Config
-    setOutputFile file c = c {configOutputFile = Right file}
+    setOutputFile file c = c {configOutputs = map (\(f, _) -> (f, Right file)) (configOutputs c)}
 
 recognizedOptions :: [OptDescr (Result Maybe -> Result Maybe)]
 recognizedOptions = commandLineOptions ++ configFileOptions ++ undocumentedOptions
